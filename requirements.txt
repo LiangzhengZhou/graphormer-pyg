@@ -1,3 +1,6 @@
 torch
 torch-geometric
 networkx
+numpy
+lmdb
+pymatgen
