@@ -68,7 +68,8 @@ def train_epoch(
         batch = batch.to(device)
         optimizer.zero_grad()
         output = global_mean_pool(model(batch), batch.batch)
-        loss = loss_fn(output, batch.y)
+        target = batch.y.view(-1, 1)
+        loss = loss_fn(output, target)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -92,7 +93,8 @@ def evaluate(
         attach_paths(batch, max_path_distance)
         batch = batch.to(device)
         output = global_mean_pool(model(batch), batch.batch)
-        loss = loss_fn(output, batch.y)
+        target = batch.y.view(-1, 1)
+        loss = loss_fn(output, target)
         total_loss += loss.item() * batch.num_graphs
         total_items += batch.num_graphs
     return total_loss / max(total_items, 1)
