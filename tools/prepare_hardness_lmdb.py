@@ -182,12 +182,16 @@ def _neighbors_from_structure(
 
 
 def _safe_atomic_number(z_value: object) -> int:
-    if np.isscalar(z_value):
-        return int(z_value)
     flattened = np.asarray(z_value).ravel()
     if flattened.size == 0:
         raise ValueError("Empty atomic number value encountered.")
-    return int(flattened[0])
+    value = flattened[0] if flattened.size > 1 else flattened.item()
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid atomic number value encountered: {value!r}"
+        ) from exc
 
 
 def _atomic_numbers_from_structure(structure: Structure) -> np.ndarray:
