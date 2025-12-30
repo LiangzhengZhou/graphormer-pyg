@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import ase.io
+from ase.neighborlist import NeighborList
 import lmdb
 import numpy as np
 import pandas as pd
@@ -163,7 +165,12 @@ def _neighbors_from_structure(
     centers, neighbors, distances, _ = structure.get_neighbor_list(r=cutoff)
     per_atom: Dict[int, List[Tuple[int, float]]] = {}
     for center, neighbor, dist in zip(centers, neighbors, distances):
-        per_atom.setdefault(int(center), []).append((int(neighbor), float(dist)))
+        per_atom.setdefault(_safe_int(center, "neighbor center"), []).append(
+            (
+                _safe_int(neighbor, "neighbor index"),
+                _safe_float(dist, "neighbor distance"),
+            )
+        )
     edge_src: List[int] = []
     edge_dst: List[int] = []
     edge_dist: List[float] = []
@@ -181,22 +188,81 @@ def _neighbors_from_structure(
     return edge_index, edge_attr
 
 
-def _safe_atomic_number(z_value: object) -> int:
-    array_value = np.asarray(z_value)
-    if array_value.size == 0:
-        raise ValueError("Empty atomic number value encountered.")
-    if array_value.size > 1:
-        LOGGER.warning(
-            "Atomic number value has multiple entries (%s); using the first.",
-            array_value,
-        )
-    value = array_value.reshape(-1)[0]
+def _neighbors_from_ase(
+    atoms: "ase.Atoms",
+    cutoff: float,
+    max_neighbors: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    cutoffs = [cutoff] * len(atoms)
+    neighbor_list = NeighborList(
+        cutoffs=cutoffs,
+        skin=0.0,
+        self_interaction=False,
+        bothways=True,
+    )
+    neighbor_list.update(atoms)
+    cell = atoms.get_cell().array
+    positions = atoms.get_positions()
+    edge_src: List[int] = []
+    edge_dst: List[int] = []
+    edge_dist: List[float] = []
+    for center in range(len(atoms)):
+        indices, offsets = neighbor_list.get_neighbors(center)
+        if len(indices) == 0:
+            continue
+        neighbor_pos = positions[indices] + offsets @ cell
+        center_pos = positions[center]
+        distances = np.linalg.norm(neighbor_pos - center_pos, axis=1)
+        order = np.argsort(distances)
+        limited = order[:max_neighbors] if max_neighbors > 0 else order
+        for idx in limited:
+            edge_src.append(center)
+            edge_dst.append(int(indices[idx]))
+            edge_dist.append(float(distances[idx]))
+    if not edge_src:
+        raise ValueError("No edges found after neighbor selection.")
+    edge_index = np.array([edge_src, edge_dst], dtype=np.int64)
+    edge_attr = np.array(edge_dist, dtype=np.float32)[:, None]
+    return edge_index, edge_attr
+
+
+def _unwrap_scalar(value: object, label: str) -> object:
+    depth_guard = 0
+    while isinstance(value, (list, tuple, np.ndarray)):
+        depth_guard += 1
+        if depth_guard > 10:
+            raise ValueError(f"{label} value is too deeply nested: {value!r}")
+        array_value = np.asarray(value, dtype=object).ravel()
+        if array_value.size == 0:
+            raise ValueError(f"Empty {label} value encountered.")
+        if array_value.size > 1:
+            LOGGER.warning(
+                "%s value has multiple entries (%s); using the first.",
+                label,
+                array_value,
+            )
+        value = array_value[0] if array_value.size > 1 else array_value.item()
+    return value
+
+
+def _safe_int(value: object, label: str) -> int:
+    value = _unwrap_scalar(value, label)
     try:
         return int(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"Invalid atomic number value encountered: {value!r}"
-        ) from exc
+        raise ValueError(f"Invalid {label} value encountered: {value!r}") from exc
+
+
+def _safe_float(value: object, label: str) -> float:
+    value = _unwrap_scalar(value, label)
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid {label} value encountered: {value!r}") from exc
+
+
+def _safe_atomic_number(z_value: object) -> int:
+    return _safe_int(z_value, "atomic number")
 
 
 def _atomic_numbers_from_structure(structure: Structure) -> np.ndarray:
@@ -257,6 +323,54 @@ def build_graph(
     }
 
 
+def build_graph_from_ase(
+    atoms: "ase.Atoms",
+    sample_id: str,
+    hardness: float,
+    cif_path: str,
+    cutoff: float,
+    max_neighbors: int,
+    max_in_degree: int,
+    max_out_degree: int,
+) -> Dict[str, object]:
+    atomic_numbers = np.array(atoms.get_atomic_numbers(), dtype=np.int64)
+    pos = np.array(atoms.get_positions(), dtype=np.float32)
+    cell = np.array(atoms.get_cell().array, dtype=np.float32)
+    pbc = np.array(atoms.get_pbc(), dtype=np.bool_)
+    edge_index, edge_attr = _neighbors_from_ase(
+        atoms, cutoff=cutoff, max_neighbors=max_neighbors
+    )
+    edge_index_tensor = torch.as_tensor(edge_index, dtype=torch.long)
+    graph = Data(
+        x=torch.zeros((len(atomic_numbers), 1), dtype=torch.float32),
+        edge_index=edge_index_tensor,
+    )
+    graph = precalculate_custom_attributes(
+        graph,
+        max_in_degree=max_in_degree,
+        max_out_degree=max_out_degree,
+    )
+    lattice = np.linalg.norm(cell, axis=1).tolist() if cell.size else []
+    return {
+        "id": sample_id,
+        "cif_path": cif_path,
+        "atomic_numbers": atomic_numbers,
+        "pos": pos,
+        "cell": cell,
+        "pbc": pbc,
+        "edge_index": edge_index,
+        "edge_attr": edge_attr,
+        "in_degree": graph.in_degree.numpy(),
+        "out_degree": graph.out_degree.numpy(),
+        "y": float(hardness),
+        "meta": {
+            "formula": atoms.get_chemical_formula(),
+            "spacegroup": "unknown",
+            "lattice": lattice,
+        },
+    }
+
+
 def _write_lmdb_records(
     env: lmdb.Environment,
     records: Iterable[Tuple[str, Dict[str, object]]],
@@ -310,6 +424,7 @@ def build_lmdb_from_csv(
     n_bins: int = 10,
     map_size_mb: int = 4096,
     verbose: bool = False,
+    use_ase: bool = False,
 ) -> Dict[str, object]:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -347,17 +462,30 @@ def build_lmdb_from_csv(
         split_name = row["split"]
         resolved_path = resolve_cif_path(cif_path, csv_dir, cif_root)
         try:
-            structure = Structure.from_file(resolved_path)
-            graph = build_graph(
-                structure=structure,
-                sample_id=sample_id,
-                hardness=float(row["hardness"]),
-                cif_path=str(resolved_path),
-                cutoff=cutoff,
-                max_neighbors=max_neighbors,
-                max_in_degree=max_in_degree,
-                max_out_degree=max_out_degree,
-            )
+            if use_ase:
+                atoms = ase.io.read(resolved_path)
+                graph = build_graph_from_ase(
+                    atoms=atoms,
+                    sample_id=sample_id,
+                    hardness=float(row["hardness"]),
+                    cif_path=str(resolved_path),
+                    cutoff=cutoff,
+                    max_neighbors=max_neighbors,
+                    max_in_degree=max_in_degree,
+                    max_out_degree=max_out_degree,
+                )
+            else:
+                structure = Structure.from_file(resolved_path)
+                graph = build_graph(
+                    structure=structure,
+                    sample_id=sample_id,
+                    hardness=float(row["hardness"]),
+                    cif_path=str(resolved_path),
+                    cutoff=cutoff,
+                    max_neighbors=max_neighbors,
+                    max_in_degree=max_in_degree,
+                    max_out_degree=max_out_degree,
+                )
             graphs_by_split[split_name].append(graph)
             all_graphs.append(graph)
         except Exception as exc:  # noqa: BLE001
@@ -484,6 +612,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verbose", action="store_true", help="Enable verbose logging."
     )
+    parser.add_argument(
+        "--use-ase",
+        action="store_true",
+        help="Parse CIFs and build neighbors via ASE instead of pymatgen.",
+    )
     return parser.parse_args()
 
 
@@ -503,6 +636,7 @@ def main() -> None:
         n_bins=args.n_bins,
         map_size_mb=args.map_size_mb,
         verbose=args.verbose,
+        use_ase=args.use_ase,
     )
 
 
