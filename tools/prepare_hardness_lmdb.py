@@ -15,11 +15,8 @@ from pymatgen.core import Structure
 from torch_geometric.data import Data
 from tqdm import tqdm
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+LOGGER = logging.getLogger(__name__)
 
-from graphormer.functional import precalculate_custom_attributes
 
 LOGGER = logging.getLogger(__name__)
 
@@ -228,6 +225,79 @@ def build_graph(
         },
     }
 
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Building graphs"):
+        sample_id = str(row["id"])
+        cif_path = str(row["cif_path"])
+        split_name = row["split"]
+        resolved_path = resolve_cif_path(cif_path, csv_dir, cif_root)
+        try:
+            structure = Structure.from_file(resolved_path)
+            graph = build_graph(
+                structure=structure,
+                sample_id=sample_id,
+                hardness=float(row["hardness"]),
+                cif_path=str(resolved_path),
+                get_edges=get_edges,
+                cutoff=cutoff,
+                max_neighbors=max_neighbors,
+            )
+            graphs_by_split[split_name].append(graph)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Failed to process %s: %s", resolved_path, exc)
+            errors.append(
+                {
+                    "id": sample_id,
+                    "cif_path": str(resolved_path),
+                    "error": str(exc),
+                }
+            )
+
+    id_maps: Dict[str, Dict[str, str]] = {}
+    for split_name, graphs in graphs_by_split.items():
+        env = lmdb.open(
+            str(lmdb_root / f"{split_name}.lmdb"),
+            map_size=map_size_mb * 1024 * 1024,
+            subdir=True,
+            lock=False,
+        )
+        id_map: Dict[str, str] = {}
+        records = ((str(idx), graph) for idx, graph in enumerate(graphs))
+        _write_lmdb_records(env, records, id_map)
+        env.sync()
+        env.close()
+        id_maps[split_name] = id_map
+        with (lmdb_root / f"{split_name}_id_map.json").open("w") as handle:
+            json.dump(id_map, handle, indent=2)
+
+    for split_name in ("train", "val", "test"):
+        split_df = df[df["split"] == split_name]
+        split_df.to_csv(out_root / f"{split_name}.csv", index=False)
+
+    if errors:
+        pd.DataFrame(errors).to_csv(out_root / "errors.csv", index=False)
+
+    stats = {
+        "total": {
+            "requested": int(len(df)),
+            "failed": int(len(errors)),
+            "successful": int(len(df) - len(errors)),
+        },
+        "splits": {
+            name: _compute_split_stats(graphs)
+            for name, graphs in graphs_by_split.items()
+        },
+    }
+    with (out_root / "stats.json").open("w") as handle:
+        json.dump(stats, handle, indent=2)
+
+    summary = {
+        "out_root": str(out_root),
+        "lmdb_root": str(lmdb_root),
+        "stats": stats,
+        "errors": errors,
+        "id_maps": id_maps,
+    }
+    return summary
 
 def _write_lmdb_records(
     env: lmdb.Environment,
