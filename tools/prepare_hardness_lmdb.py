@@ -1,285 +1,432 @@
 import argparse
-import csv
 import json
+import logging
+import math
 import pickle
-import random
-import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import lmdb
 import numpy as np
+import pandas as pd
 from pymatgen.core import Structure
-from torch_geometric.data import Data
+from tqdm import tqdm
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from graphormer.functional import precalculate_custom_attributes
+LOGGER = logging.getLogger(__name__)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Prepare hardness LMDB from CIF CSV.")
-    parser.add_argument("--input-csv", required=True, help="Input CSV with id,cif_path,hardness.")
-    parser.add_argument("--output-lmdb", required=True, help="Output LMDB path.")
-    parser.add_argument("--cif-root", default=None, help="Root for relative CIF paths.")
-    parser.add_argument("--split-mode", choices=["from_csv", "auto"], default="auto")
-    parser.add_argument("--train-ratio", type=float, default=0.8)
-    parser.add_argument("--valid-ratio", type=float, default=0.1)
-    parser.add_argument("--test-ratio", type=float, default=0.1)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--cutoff", type=float, default=6.0)
-    parser.add_argument("--max-neighbors", type=int, default=50)
-    parser.add_argument("--max-in-degree", type=int, default=None)
-    parser.add_argument("--max-out-degree", type=int, default=None)
-    parser.add_argument("--strict", action="store_true", help="Fail on first error.")
-    parser.add_argument("--splits-json", default=None, help="Output splits JSON path.")
-    parser.add_argument("--splits-dir", default=None, help="Output split CSV directory.")
-    parser.add_argument("--bad-cases", default=None, help="Output bad cases CSV path.")
-    return parser.parse_args()
+@dataclass(frozen=True)
+class SplitRatios:
+    train: float
+    val: float
+    test: float
+
+    def normalize(self) -> "SplitRatios":
+        total = self.train + self.val + self.test
+        if total <= 0:
+            raise ValueError("Split ratios must sum to a positive value.")
+        return SplitRatios(
+            train=self.train / total,
+            val=self.val / total,
+            test=self.test / total,
+        )
 
 
-def read_csv_rows(path: Path) -> List[Dict[str, str]]:
-    with path.open("r", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        rows = [row for row in reader]
-    return rows
-
-
-def validate_split_column(rows: List[Dict[str, str]]) -> bool:
-    has_split = any("split" in row for row in rows)
-    if not has_split:
-        return False
-    missing = [row for row in rows if "split" not in row or not row["split"]]
-    if missing:
-        raise ValueError("Split column present but missing values in some rows.")
-    return True
-
-
-def resolve_cif_path(cif_path: str, cif_root: Path) -> Path:
+def resolve_cif_path(
+    cif_path: str, csv_dir: Path, cif_root: Optional[Path]
+) -> Path:
     path = Path(cif_path)
-    if not path.is_absolute():
-        path = cif_root / path
-    return path
+    if path.is_absolute():
+        return path
+    if cif_root is not None:
+        return cif_root / path
+    return csv_dir / path
 
 
-def build_graph_from_structure(
+def _normalize_split_label(label: str) -> str:
+    normalized = label.strip().lower()
+    if normalized in {"train", "val", "test"}:
+        return normalized
+    if normalized == "valid":
+        return "val"
+    raise ValueError(f"Unsupported split label: {label}")
+
+
+def _ensure_required_columns(df: pd.DataFrame) -> None:
+    required = {"id", "cif_path", "hardness"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+
+def _validate_split_column(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["split"] = df["split"].map(_normalize_split_label)
+    counts = df["split"].value_counts()
+    for split in ("train", "val", "test"):
+        if counts.get(split, 0) == 0:
+            raise ValueError(f"Split column is missing '{split}' samples.")
+    if df["hardness"].isnull().any():
+        raise ValueError("Hardness labels contain missing values.")
+    return df
+
+
+def _stratified_split(
+    df: pd.DataFrame,
+    ratios: SplitRatios,
+    seed: int,
+    n_bins: int,
+) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    df = df.copy()
+    labels = pd.qcut(
+        df["hardness"],
+        q=min(n_bins, df.shape[0]),
+        duplicates="drop",
+    )
+    df["_bin"] = labels
+    splits = []
+    ratios = ratios.normalize()
+    for _, group in df.groupby("_bin"):
+        idx = group.index.to_numpy()
+        rng.shuffle(idx)
+        n_total = len(idx)
+        n_train = int(math.floor(n_total * ratios.train))
+        n_val = int(math.floor(n_total * ratios.val))
+        train_idx = idx[:n_train]
+        val_idx = idx[n_train : n_train + n_val]
+        test_idx = idx[n_train + n_val :]
+        splits.append((train_idx, "train"))
+        splits.append((val_idx, "val"))
+        splits.append((test_idx, "test"))
+    split_series = pd.Series(index=df.index, dtype=str)
+    for indices, split_name in splits:
+        split_series.loc[indices] = split_name
+    df["split"] = split_series
+    df = df.drop(columns=["_bin"])
+    return df
+
+
+def _random_split(
+    df: pd.DataFrame, ratios: SplitRatios, seed: int
+) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    ratios = ratios.normalize()
+    indices = df.index.to_numpy()
+    rng.shuffle(indices)
+    n_total = len(indices)
+    n_train = int(math.floor(n_total * ratios.train))
+    n_val = int(math.floor(n_total * ratios.val))
+    train_idx = indices[:n_train]
+    val_idx = indices[n_train : n_train + n_val]
+    test_idx = indices[n_train + n_val :]
+    df = df.copy()
+    df.loc[train_idx, "split"] = "train"
+    df.loc[val_idx, "split"] = "val"
+    df.loc[test_idx, "split"] = "test"
+    return df
+
+
+def build_splits(
+    df: pd.DataFrame,
+    split: Optional[Sequence[float]],
+    seed: int = 42,
+    stratify: bool = False,
+    n_bins: int = 10,
+) -> pd.DataFrame:
+    _ensure_required_columns(df)
+    if "split" in df.columns:
+        return _validate_split_column(df)
+
+    if split is None:
+        raise ValueError("Split ratios must be provided when split column absent.")
+    if len(split) != 3:
+        raise ValueError("Split ratios must contain three values.")
+    ratios = SplitRatios(*split)
+    if stratify:
+        return _stratified_split(df, ratios, seed, n_bins=n_bins)
+    return _random_split(df, ratios, seed)
+
+
+def _neighbors_from_structure(
     structure: Structure,
     cutoff: float,
     max_neighbors: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    atomic_numbers = np.array([site.specie.Z for site in structure], dtype=np.int64)
-    pos = np.array(structure.cart_coords, dtype=np.float32)
-    cell = np.array(structure.lattice.matrix, dtype=np.float32)
-    pbc = np.array([True, True, True], dtype=np.bool_)
-
-    centers, neighbors, _, distances = structure.get_neighbor_list(r=cutoff)
-    neighbor_map: Dict[int, List[Tuple[int, float]]] = {i: [] for i in range(len(structure))}
-    for center, neighbor, distance in zip(centers, neighbors, distances):
-        neighbor_map[int(center)].append((int(neighbor), float(distance)))
-
+) -> Tuple[np.ndarray, np.ndarray]:
+    centers, neighbors, distances, _ = structure.get_neighbor_list(r=cutoff)
+    per_atom: Dict[int, List[Tuple[int, float]]] = {}
+    for center, neighbor, dist in zip(centers, neighbors, distances):
+        per_atom.setdefault(int(center), []).append((int(neighbor), float(dist)))
     edge_src: List[int] = []
     edge_dst: List[int] = []
     edge_dist: List[float] = []
-    for center, entries in neighbor_map.items():
-        entries_sorted = sorted(entries, key=lambda item: item[1])[:max_neighbors]
-        for neighbor, distance in entries_sorted:
+    for center, neighbor_list in per_atom.items():
+        neighbor_list.sort(key=lambda item: item[1])
+        limited = neighbor_list[:max_neighbors] if max_neighbors > 0 else neighbor_list
+        for neighbor, dist in limited:
             edge_src.append(center)
             edge_dst.append(neighbor)
-            edge_dist.append(distance)
-
-    if not edge_src:
-        raise ValueError("No edges found after neighbor selection.")
-
-    edge_index = np.stack([edge_src, edge_dst], axis=0).astype(np.int64)
-    edge_attr = np.array(edge_dist, dtype=np.float32)[:, None]
-    return atomic_numbers, pos, cell, pbc, edge_index, edge_attr
+            edge_dist.append(dist)
+    edge_index = np.array([edge_src, edge_dst], dtype=np.int64)
+    edge_dist = np.array(edge_dist, dtype=np.float32)
+    return edge_index, edge_dist
 
 
-def create_splits(
-    rows: List[Dict[str, str]],
-    split_mode: str,
-    seed: int,
-    train_ratio: float,
-    valid_ratio: float,
-    test_ratio: float,
-) -> Dict[str, List[str]]:
-    ids = [row["id"] for row in rows]
-    if split_mode == "from_csv":
-        splits: Dict[str, List[str]] = {"train": [], "valid": [], "test": []}
-        for row in rows:
-            split = row["split"].strip().lower()
-            if split not in splits:
-                raise ValueError(f"Invalid split value: {split}")
-            splits[split].append(row["id"])
-        if not splits["train"] or not splits["valid"]:
-            raise ValueError("Train/valid splits must be non-empty.")
-        return splits
-
-    if train_ratio + valid_ratio + test_ratio <= 0:
-        raise ValueError("Split ratios must sum to a positive number.")
-    total = train_ratio + valid_ratio + test_ratio
-    train_ratio /= total
-    valid_ratio /= total
-    test_ratio /= total
-
-    rng = random.Random(seed)
-    shuffled = ids[:]
-    rng.shuffle(shuffled)
-    n_total = len(shuffled)
-    n_train = int(n_total * train_ratio)
-    n_valid = int(n_total * valid_ratio)
-    n_test = n_total - n_train - n_valid
-
-    splits = {
-        "train": shuffled[:n_train],
-        "valid": shuffled[n_train:n_train + n_valid],
-        "test": shuffled[n_train + n_valid:],
+def build_graph(
+    structure: Structure,
+    sample_id: str,
+    hardness: float,
+    cif_path: str,
+    get_edges: bool,
+    cutoff: float,
+    max_neighbors: int,
+) -> Dict[str, object]:
+    z = np.array([site.specie.Z for site in structure], dtype=np.int64)
+    graph: Dict[str, object] = {
+        "id": sample_id,
+        "num_nodes": int(structure.num_sites),
+        "z": z,
+        "pos": np.array(structure.cart_coords, dtype=np.float32),
+        "y": float(hardness),
+        "cif_path": cif_path,
+        "meta": {
+            "formula": structure.composition.reduced_formula,
+            "spacegroup": structure.get_space_group_info()[0],
+            "lattice": structure.lattice.abc,
+        },
     }
-    if not splits["train"] or not splits["valid"]:
-        raise ValueError("Train/valid splits must be non-empty.")
-    return splits
+    if get_edges:
+        edge_index, edge_dist = _neighbors_from_structure(
+            structure, cutoff=cutoff, max_neighbors=max_neighbors
+        )
+        graph["edge_index"] = edge_index
+        graph["edge_dist"] = edge_dist
+    return graph
 
 
-def write_split_csvs(splits: Dict[str, List[str]], output_dir: Path) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for split_name, ids in splits.items():
-        path = output_dir / f"{split_name}.csv"
-        with path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(["id"])
-            for sample_id in ids:
-                writer.writerow([sample_id])
+def _write_lmdb_records(
+    env: lmdb.Environment,
+    records: Iterable[Tuple[str, Dict[str, object]]],
+    id_map: Dict[str, str],
+) -> None:
+    with env.begin(write=True) as txn:
+        for key, record in records:
+            payload = pickle.dumps(record, protocol=pickle.HIGHEST_PROTOCOL)
+            txn.put(key.encode("utf-8"), payload)
+            id_map[record["id"]] = key
+
+
+def _compute_split_stats(graphs: List[Dict[str, object]]) -> Dict[str, object]:
+    hardness = np.array([g["y"] for g in graphs], dtype=np.float64)
+    num_nodes = np.array([g["num_nodes"] for g in graphs], dtype=np.int64)
+    num_edges = np.array(
+        [g.get("edge_index", np.empty((2, 0))).shape[1] for g in graphs],
+        dtype=np.int64,
+    )
+    stats = {
+        "count": int(len(graphs)),
+        "hardness_mean": float(hardness.mean()) if len(hardness) else None,
+        "hardness_std": float(hardness.std()) if len(hardness) else None,
+        "num_nodes": {
+            "min": int(num_nodes.min()) if len(num_nodes) else None,
+            "max": int(num_nodes.max()) if len(num_nodes) else None,
+            "mean": float(num_nodes.mean()) if len(num_nodes) else None,
+        },
+        "num_edges": {
+            "min": int(num_edges.min()) if len(num_edges) else None,
+            "max": int(num_edges.max()) if len(num_edges) else None,
+            "mean": float(num_edges.mean()) if len(num_edges) else None,
+        },
+    }
+    return stats
+
+
+def build_lmdb_from_csv(
+    csv_path: Path,
+    out_root: Path,
+    cif_root: Optional[Path] = None,
+    split: Optional[Sequence[float]] = None,
+    get_edges: bool = False,
+    cutoff: float = 8.0,
+    max_neighbors: int = 12,
+    seed: int = 42,
+    stratify: bool = False,
+    n_bins: int = 10,
+    map_size_mb: int = 4096,
+    verbose: bool = False,
+) -> Dict[str, object]:
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+    csv_path = Path(csv_path)
+    out_root = Path(out_root)
+    csv_dir = csv_path.parent
+    if cif_root is not None:
+        cif_root = Path(cif_root)
+
+    df = pd.read_csv(csv_path)
+    if "split" in df.columns and split is not None:
+        LOGGER.info("CSV contains split column; ignoring --split values.")
+    df = build_splits(df, split=split, seed=seed, stratify=stratify, n_bins=n_bins)
+    df = df[["id", "cif_path", "hardness", "split"]]
+
+    out_root.mkdir(parents=True, exist_ok=True)
+    lmdb_root = out_root / "lmdb"
+    lmdb_root.mkdir(parents=True, exist_ok=True)
+
+    errors: List[Dict[str, str]] = []
+    graphs_by_split: Dict[str, List[Dict[str, object]]] = {
+        "train": [],
+        "val": [],
+        "test": [],
+    }
+
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Building graphs"):
+        sample_id = str(row["id"])
+        cif_path = str(row["cif_path"])
+        split_name = row["split"]
+        resolved_path = resolve_cif_path(cif_path, csv_dir, cif_root)
+        try:
+            structure = Structure.from_file(resolved_path)
+            graph = build_graph(
+                structure=structure,
+                sample_id=sample_id,
+                hardness=float(row["hardness"]),
+                cif_path=str(resolved_path),
+                get_edges=get_edges,
+                cutoff=cutoff,
+                max_neighbors=max_neighbors,
+            )
+            graphs_by_split[split_name].append(graph)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Failed to process %s: %s", resolved_path, exc)
+            errors.append(
+                {
+                    "id": sample_id,
+                    "cif_path": str(resolved_path),
+                    "error": str(exc),
+                }
+            )
+
+    id_maps: Dict[str, Dict[str, str]] = {}
+    for split_name, graphs in graphs_by_split.items():
+        env = lmdb.open(
+            str(lmdb_root / f"{split_name}.lmdb"),
+            map_size=map_size_mb * 1024 * 1024,
+            subdir=True,
+            lock=False,
+        )
+        id_map: Dict[str, str] = {}
+        records = ((str(idx), graph) for idx, graph in enumerate(graphs))
+        _write_lmdb_records(env, records, id_map)
+        env.sync()
+        env.close()
+        id_maps[split_name] = id_map
+        with (lmdb_root / f"{split_name}_id_map.json").open("w") as handle:
+            json.dump(id_map, handle, indent=2)
+
+    for split_name in ("train", "val", "test"):
+        split_df = df[df["split"] == split_name]
+        split_df.to_csv(out_root / f"{split_name}.csv", index=False)
+
+    if errors:
+        pd.DataFrame(errors).to_csv(out_root / "errors.csv", index=False)
+
+    stats = {
+        "total": {
+            "requested": int(len(df)),
+            "failed": int(len(errors)),
+            "successful": int(len(df) - len(errors)),
+        },
+        "splits": {
+            name: _compute_split_stats(graphs)
+            for name, graphs in graphs_by_split.items()
+        },
+    }
+    with (out_root / "stats.json").open("w") as handle:
+        json.dump(stats, handle, indent=2)
+
+    summary = {
+        "out_root": str(out_root),
+        "lmdb_root": str(lmdb_root),
+        "stats": stats,
+        "errors": errors,
+        "id_maps": id_maps,
+    }
+    return summary
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build graph LMDB datasets from hardness CSV + CIF files."
+    )
+    parser.add_argument("--csv", required=True, help="Path to input CSV.")
+    parser.add_argument("--out-root", required=True, help="Output root directory.")
+    parser.add_argument(
+        "--cif-root",
+        default=None,
+        help="Optional root for resolving relative cif_path values.",
+    )
+    parser.add_argument("--get-edges", action="store_true", help="Enable edges.")
+    parser.add_argument(
+        "--cutoff", type=float, default=8.0, help="Edge cutoff radius."
+    )
+    parser.add_argument(
+        "--max-neighbors",
+        type=int,
+        default=12,
+        help="Maximum neighbors per atom.",
+    )
+    parser.add_argument(
+        "--split",
+        nargs=3,
+        type=float,
+        default=None,
+        metavar=("TRAIN", "VAL", "TEST"),
+        help="Split ratios if CSV lacks split column.",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument(
+        "--stratify",
+        action="store_true",
+        help="Stratify splits by hardness quantiles.",
+    )
+    parser.add_argument(
+        "--n-bins",
+        type=int,
+        default=10,
+        help="Number of quantile bins for stratification.",
+    )
+    parser.add_argument(
+        "--map-size-mb",
+        type=int,
+        default=4096,
+        help="LMDB map size in MB.",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", help="Enable verbose logging."
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    input_csv = Path(args.input_csv)
-    cif_root = Path(args.cif_root) if args.cif_root else input_csv.parent
-    output_lmdb = Path(args.output_lmdb)
-
-    rows = read_csv_rows(input_csv)
-    if not rows:
-        raise ValueError("No rows found in input CSV.")
-
-    if args.split_mode == "from_csv":
-        if not validate_split_column(rows):
-            raise ValueError("split-mode from_csv requires split column in CSV.")
-
-    splits = create_splits(
-        rows,
-        split_mode=args.split_mode,
+    build_lmdb_from_csv(
+        csv_path=Path(args.csv),
+        out_root=Path(args.out_root),
+        cif_root=Path(args.cif_root) if args.cif_root else None,
+        split=args.split,
+        get_edges=args.get_edges,
+        cutoff=args.cutoff,
+        max_neighbors=args.max_neighbors,
         seed=args.seed,
-        train_ratio=args.train_ratio,
-        valid_ratio=args.valid_ratio,
-        test_ratio=args.test_ratio,
+        stratify=args.stratify,
+        n_bins=args.n_bins,
+        map_size_mb=args.map_size_mb,
+        verbose=args.verbose,
     )
-
-    max_in_degree = args.max_in_degree or args.max_neighbors
-    max_out_degree = args.max_out_degree or args.max_neighbors
-
-    output_lmdb.parent.mkdir(parents=True, exist_ok=True)
-    env = lmdb.open(str(output_lmdb), map_size=1099511627776)
-
-    bad_cases_path = Path(args.bad_cases) if args.bad_cases else output_lmdb.parent / "bad_cases.csv"
-    bad_cases: List[List[str]] = []
-    all_ids: List[str] = []
-    id_to_index: Dict[str, int] = {}
-
-    success = 0
-    with env.begin(write=True) as txn:
-        for idx, row in enumerate(rows):
-            sample_id = row["id"]
-            cif_path = resolve_cif_path(row["cif_path"], cif_root)
-            hardness = float(row["hardness"])
-            try:
-                structure = Structure.from_file(str(cif_path))
-                (
-                    atomic_numbers,
-                    pos,
-                    cell,
-                    pbc,
-                    edge_index,
-                    edge_attr,
-                ) = build_graph_from_structure(
-                    structure,
-                    cutoff=args.cutoff,
-                    max_neighbors=args.max_neighbors,
-                )
-                graph = Data(
-                    x=np.zeros((len(atomic_numbers), 1), dtype=np.float32),
-                    edge_index=edge_index,
-                )
-                graph = precalculate_custom_attributes(
-                    graph,
-                    max_in_degree=max_in_degree,
-                    max_out_degree=max_out_degree,
-                )
-                record = {
-                    "id": sample_id,
-                    "cif_path": str(cif_path),
-                    "atomic_numbers": atomic_numbers,
-                    "pos": pos,
-                    "cell": cell,
-                    "pbc": pbc,
-                    "edge_index": edge_index,
-                    "edge_attr": edge_attr,
-                    "in_degree": graph.in_degree.numpy(),
-                    "out_degree": graph.out_degree.numpy(),
-                    "y": hardness,
-                    "cutoff": args.cutoff,
-                    "max_neighbors": args.max_neighbors,
-                }
-                key = str(idx).encode("utf-8")
-                txn.put(key, pickle.dumps(record))
-                all_ids.append(sample_id)
-                id_to_index[sample_id] = idx
-                success += 1
-            except Exception as exc:
-                reason = str(exc)
-                bad_cases.append([sample_id, str(cif_path), reason])
-                if args.strict:
-                    raise
-
-        txn.put(b"__keys__", json.dumps(all_ids).encode("utf-8"))
-        txn.put(b"__id_to_index__", json.dumps(id_to_index).encode("utf-8"))
-        txn.put(
-            b"__meta__",
-            json.dumps(
-                {
-                    "cutoff": args.cutoff,
-                    "max_neighbors": args.max_neighbors,
-                    "split_mode": args.split_mode,
-                    "seed": args.seed,
-                    "train_ratio": args.train_ratio,
-                    "valid_ratio": args.valid_ratio,
-                    "test_ratio": args.test_ratio,
-                }
-            ).encode("utf-8"),
-        )
-
-    if bad_cases:
-        with bad_cases_path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(["id", "cif_path", "reason"])
-            writer.writerows(bad_cases)
-
-    splits_json = Path(args.splits_json) if args.splits_json else output_lmdb.parent / "splits.json"
-    with splits_json.open("w", encoding="utf-8") as handle:
-        json.dump(splits, handle, indent=2)
-
-    if args.splits_dir:
-        write_split_csvs(splits, Path(args.splits_dir))
-    else:
-        write_split_csvs(splits, output_lmdb.parent)
-
-    total = len(rows)
-    print(f"Total samples: {total}")
-    print(f"Success: {success}")
-    print(f"Failed: {len(bad_cases)}")
-    for split_name, ids in splits.items():
-        print(f"{split_name}: {len(ids)}")
 
 
 if __name__ == "__main__":
